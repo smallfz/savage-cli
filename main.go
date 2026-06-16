@@ -98,13 +98,57 @@ func printRows(rows client.Rows) {
 	// }
 }
 
-func completer(d prompt.Document) []prompt.Suggest {
-	return nil
-	s := []prompt.Suggest{
-		{Text: "\\exit", Description: ""},
-		{Text: "?", Description: ""},
+var (
+	candidates = []prompt.Suggest{}
+)
+
+func updateCandidates(x context.Context, conn client.Conn) {
+	q := "select name from sqlite_master where type='table'"
+	if stmt, err := conn.PrepareStmt(x, q); err != nil {
+		fmt.Printf("prepare: %v\r\n", err)
+	} else {
+		defer stmt.Close()
+		if rs, err := stmt.QueryWithArgs(x, nil); err != nil {
+			fmt.Printf("query: %v\r\n", err)
+		} else {
+			defer rs.Close()
+			names := []string{}
+			for {
+				row := make([]any, 1)
+				err := rs.NextRow(row)
+				if err != nil {
+					break
+				}
+				if name, ok := row[0].(string); ok {
+					names = append(names, name)
+				}
+			}
+			cl := make([]prompt.Suggest, len(names))
+			for i, name := range names {
+				cl[i] = prompt.Suggest{Text: name}
+			}
+			candidates = cl
+			fmt.Printf("candidates: %s\r\n", strings.Join(names, ","))
+		}
 	}
-	return prompt.FilterHasPrefix(s, d.GetWordBeforeCursor(), true)
+}
+
+func getSuggestions() []prompt.Suggest {
+	return candidates
+}
+
+func completer(d prompt.Document) []prompt.Suggest {
+	// return nil
+	// s := []prompt.Suggest{
+	// 	{Text: "\\exit", Description: ""},
+	// 	{Text: "?", Description: ""},
+	// }
+	hint := d.GetWordBeforeCursor()
+	if len(hint) > 0 {
+		s := getSuggestions()
+		return prompt.FilterHasPrefix(s, hint, true)
+	}
+	return nil
 }
 
 type conf struct {
@@ -169,6 +213,8 @@ func main() {
 
 	x, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	updateCandidates(x, conn)
 
 	buf := new(bytes.Buffer)
 
