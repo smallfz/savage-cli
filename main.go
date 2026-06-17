@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"regexp"
 	"runtime"
 	"strings"
 	"syscall"
@@ -98,6 +99,14 @@ func printRows(rows client.Rows) {
 	// }
 }
 
+func removeCRLF(text string) string {
+	pt := regexp.MustCompile(`(?is)[\r\n]+`)
+	return pt.ReplaceAllString(text, " ")
+	// text = strings.ReplaceAll(text, "\r", " ")
+	// text = strings.ReplaceAll(text, "\n", "")
+	// return text
+}
+
 var (
 	candidates = []prompt.Suggest{}
 )
@@ -127,8 +136,14 @@ func updateCandidates(x context.Context, conn client.Conn) {
 			for i, name := range names {
 				cl[i] = prompt.Suggest{Text: name}
 			}
+			cl = append(cl, prompt.Suggest{
+				Text: "sqlite_master",
+			})
+			cl = append(cl, prompt.Suggest{
+				Text: "sqlite_schema",
+			})
 			candidates = cl
-			fmt.Printf("candidates: %s\r\n", strings.Join(names, ","))
+			// fmt.Printf("candidates: %s\r\n", strings.Join(names, ","))
 		}
 	}
 }
@@ -276,7 +291,12 @@ func main() {
 		return "", isFragment()
 	}
 
+	history := []string{}
+
 	evalLine := func(line string) {
+		if buf.Len() > 0 && len(line) > 0 {
+			buf.Write([]byte("\r\n"))
+		}
 		buf.Write([]byte(line))
 		q := strings.TrimSpace(string(buf.Bytes()))
 		switch q {
@@ -286,6 +306,7 @@ func main() {
 			return
 		}
 		if strings.HasSuffix(q, ";") {
+			history = append(history, removeCRLF(q))
 			if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
 				t := stmts[0]
 				runSQL(t.cmd, q)
@@ -294,23 +315,42 @@ func main() {
 		}
 	}
 
-	exitChecker := func(line string, breakLine bool) bool {
-		if breakLine {
-			switch strings.ToLower(strings.TrimSpace(line)) {
-			case ".exit", ".quit":
-				return true
-			}
-		}
-		return false
-	}
+	// exitChecker := func(line string, breakLine bool) bool {
+	// 	if breakLine {
+	// 		switch strings.ToLower(strings.TrimSpace(line)) {
+	// 		case ".exit", ".quit":
+	// 			return true
+	// 		}
+	// 	}
+	// 	return false
+	// }
 
-	p := prompt.New(
-		evalLine,
-		completer,
-		prompt.OptionSetExitCheckerOnInput(exitChecker),
-		prompt.OptionLivePrefix(getLivePrefix),
-	)
-	p.Run()
+	// p := prompt.New(
+	// 	evalLine,
+	// 	completer,
+	// 	prompt.OptionSetExitCheckerOnInput(exitChecker),
+	// 	prompt.OptionLivePrefix(getLivePrefix),
+	// )
+	// p.Run()
+
+	prefix := "> "
+	for {
+		content := prompt.Input(
+			prefix,
+			completer,
+			prompt.OptionHistory(history),
+			prompt.OptionLivePrefix(getLivePrefix),
+			prompt.OptionPrefix(prefix),
+			prompt.OptionPrefixTextColor(prompt.Blue),
+			prompt.OptionSwitchKeyBindMode(prompt.EmacsKeyBind),
+		)
+		content = strings.TrimSpace(strings.ToLower(content))
+		switch content {
+		case "exit", "quit":
+			return
+		}
+		evalLine(content)
+	}
 }
 
 func recoverTerm() {
