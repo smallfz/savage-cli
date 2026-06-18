@@ -1,17 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"flag"
 	"fmt"
-	"github.com/c-bata/go-prompt"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/rqlite/sql"
 	"github.com/smallfz/savage-wire/log"
 	"github.com/smallfz/savage-wire/wire/client"
 	"golang.org/x/term"
+	"io"
 	"log/slog"
 	"net/url"
 	"os"
@@ -26,6 +25,36 @@ import (
 func init() {
 	table.StyleDefault.Format.Header = text.FormatDefault
 	table.StyleDefault.Format.HeaderAlign = text.AlignCenter
+}
+
+type hist struct {
+	lines []string
+}
+
+var _ term.History = (*hist)(nil)
+
+func newSimpleHistory() *hist {
+	return &hist{
+		lines: []string{},
+	}
+}
+
+func (h *hist) Add(line string) {
+}
+
+func (h *hist) add(line string) {
+	h.lines = append(h.lines, removeCRLF(line))
+}
+
+func (h *hist) Len() int {
+	return len(h.lines)
+}
+
+func (h *hist) At(i int) string {
+	if i >= 0 && i < len(h.lines) {
+		return h.lines[len(h.lines)-1-i]
+	}
+	return ""
 }
 
 type stmtInfo struct {
@@ -61,7 +90,7 @@ func parseSQLite(q string) ([]*stmtInfo, error) {
 	return results, nil
 }
 
-func printRows(rows client.Rows) {
+func printRows(w io.Writer, rows client.Rows) {
 	cols := rows.Columns()
 	tw := table.NewWriter()
 
@@ -82,88 +111,12 @@ func printRows(rows client.Rows) {
 		}
 		tw.AppendRows([]table.Row{trow})
 	}
-	fmt.Println(tw.Render())
-	// fmt.Println(strings.Join(cols, "|"))
-	// for {
-	//     row := make([]any, len(cols))
-	//     if err := rows.NextRow(row); err != nil {
-	//         break
-	//     }
-	//     for i, v := range row {
-	//         if i > 0 {
-	//             fmt.Printf("|")
-	//         }
-	//         fmt.Printf("%v", v)
-	//     }
-	//     fmt.Println("")
-	// }
+	fmt.Fprintln(w, tw.Render())
 }
 
 func removeCRLF(text string) string {
 	pt := regexp.MustCompile(`(?is)[\r\n]+`)
 	return pt.ReplaceAllString(text, " ")
-	// text = strings.ReplaceAll(text, "\r", " ")
-	// text = strings.ReplaceAll(text, "\n", "")
-	// return text
-}
-
-var (
-	candidates = []prompt.Suggest{}
-)
-
-func updateCandidates(x context.Context, conn client.Conn) {
-	q := "select name from sqlite_master where type='table'"
-	if stmt, err := conn.PrepareStmt(x, q); err != nil {
-		fmt.Printf("prepare: %v\r\n", err)
-	} else {
-		defer stmt.Close()
-		if rs, err := stmt.QueryWithArgs(x, nil); err != nil {
-			fmt.Printf("query: %v\r\n", err)
-		} else {
-			defer rs.Close()
-			names := []string{}
-			for {
-				row := make([]any, 1)
-				err := rs.NextRow(row)
-				if err != nil {
-					break
-				}
-				if name, ok := row[0].(string); ok {
-					names = append(names, name)
-				}
-			}
-			cl := make([]prompt.Suggest, len(names))
-			for i, name := range names {
-				cl[i] = prompt.Suggest{Text: name}
-			}
-			cl = append(cl, prompt.Suggest{
-				Text: "sqlite_master",
-			})
-			cl = append(cl, prompt.Suggest{
-				Text: "sqlite_schema",
-			})
-			candidates = cl
-			// fmt.Printf("candidates: %s\r\n", strings.Join(names, ","))
-		}
-	}
-}
-
-func getSuggestions() []prompt.Suggest {
-	return candidates
-}
-
-func completer(d prompt.Document) []prompt.Suggest {
-	// return nil
-	// s := []prompt.Suggest{
-	// 	{Text: "\\exit", Description: ""},
-	// 	{Text: "?", Description: ""},
-	// }
-	hint := d.GetWordBeforeCursor()
-	if len(hint) > 0 {
-		s := getSuggestions()
-		return prompt.FilterHasPrefix(s, hint, true)
-	}
-	return nil
 }
 
 type conf struct {
@@ -172,9 +125,7 @@ type conf struct {
 	pwd string
 }
 
-func main() {
-	defer recoverTerm()
-
+func makeConnFromOSArgs(x context.Context) (client.Conn, error) {
 	cfg := &conf{
 		uri: "wss://root@localhost:3099/demo",
 	}
@@ -184,7 +135,7 @@ func main() {
 	uri, err := url.Parse(cfg.uri)
 	if err != nil {
 		fmt.Printf("Server URI: %v\r\n", err)
-		return
+		return nil, err
 	} else {
 		uid, pwd := "", cfg.pwd
 		if uri.User != nil {
@@ -213,143 +164,140 @@ func main() {
 		cfg.uid = uid
 	}
 
-	log.SetLevel(slog.LevelWarn)
-
 	fmt.Printf("Connecting to %s@%s...\r\n", cfg.uid, uri.Hostname())
 	conn, err := client.Open(uri.String())
 	if err != nil {
 		fmt.Printf("Open: %v\r\n", err)
-		return
+		return nil, err
 	}
-	defer conn.Close()
-	fmt.Printf("connected as user %s.\r\n", uri.User.Username())
 
-	fmt.Println("Welcome to Savage-DB CLI!")
+	return conn, nil
+}
+
+func main() {
+	// defer recoverTerm()
+
+	log.SetLevel(slog.LevelWarn)
 
 	x, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	updateCandidates(x, conn)
-
-	buf := new(bytes.Buffer)
-
-	runQuery := func(q string) {
-		stmt, err := conn.PrepareStmt(x, q)
-		if err != nil {
-			fmt.Printf("prepare: %v\r\n", err)
-			return
-		}
-		defer stmt.Close()
-		rows, err := stmt.QueryWithArgs(x, nil)
-		if err != nil {
-			fmt.Printf("query: %v\r\n", err)
-			return
-		}
-		defer rows.Close()
-		printRows(rows)
+	conn, err := makeConnFromOSArgs(x)
+	if err != nil {
+		return
 	}
+	defer conn.Close()
 
-	runExec := func(cmdPrefix, q string) {
-		rs, err := conn.ExecWithArgs(x, q, nil)
-		if err != nil {
-			fmt.Printf("exec: %v\r\n", err)
-			return
-		}
-		if len(cmdPrefix) == 0 {
-			fmt.Println("OK")
-			return
-		}
-		if rc, err := rs.RowsAffected(); err != nil {
-			fmt.Printf("%s: ok\r\n", cmdPrefix)
-		} else {
-			fmt.Printf("%s: %d\r\n", cmdPrefix, rc)
-		}
+	fmt.Printf("connected as user %s.\r\n", conn.AuthInfo().User)
+
+	x = context.WithValue(x, "conn", conn)
+
+	runREPL(x, conn)
+}
+
+func runQuery(x context.Context, w io.Writer, q string) {
+	conn := x.Value("conn").(client.Conn)
+	stmt, err := conn.PrepareStmt(x, q)
+	if err != nil {
+		fmt.Printf("prepare: %v\r\n", err)
+		return
 	}
-
-	runSQL := func(cmdPrefix, q string) {
-		if strings.EqualFold(cmdPrefix, "SELECT") {
-			runQuery(q)
-		} else {
-			runExec(cmdPrefix, q)
-		}
+	defer stmt.Close()
+	rows, err := stmt.QueryWithArgs(x, nil)
+	if err != nil {
+		fmt.Printf("query: %v\r\n", err)
+		return
 	}
+	defer rows.Close()
+	printRows(w, rows)
+}
 
-	isFragment := func() bool {
-		if buf.Len() > 0 {
-			q := strings.TrimSpace(string(buf.Bytes()))
-			if strings.HasSuffix(q, ";") {
-				if _, err := parseSQLite(q); err == nil {
-					return false
-				}
-			}
-			return true
-		}
-		return false
+func runExec(x context.Context, w io.Writer, cmdPrefix, q string) {
+	conn := x.Value("conn").(client.Conn)
+	rs, err := conn.ExecWithArgs(x, q, nil)
+	if err != nil {
+		fmt.Printf("exec: %v\r\n", err)
+		return
 	}
-
-	getLivePrefix := func() (prefix string, live bool) {
-		return "", isFragment()
+	if len(cmdPrefix) == 0 {
+		fmt.Println("OK")
+		return
 	}
-
-	history := []string{}
-
-	evalLine := func(line string) {
-		if buf.Len() > 0 && len(line) > 0 {
-			buf.Write([]byte("\r\n"))
-		}
-		buf.Write([]byte(line))
-		q := strings.TrimSpace(string(buf.Bytes()))
-		switch q {
-		case "?", "help", ".help":
-			buf.Reset()
-			fmt.Println("type .exit to quit.")
-			return
-		}
-		if strings.HasSuffix(q, ";") {
-			history = append(history, removeCRLF(q))
-			if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
-				t := stmts[0]
-				runSQL(t.cmd, q)
-			}
-			buf.Reset()
-		}
+	if rc, err := rs.RowsAffected(); err != nil {
+		fmt.Printf("%s: ok\r\n", cmdPrefix)
+	} else {
+		fmt.Printf("%s: %d\r\n", cmdPrefix, rc)
 	}
+}
 
-	// exitChecker := func(line string, breakLine bool) bool {
-	// 	if breakLine {
-	// 		switch strings.ToLower(strings.TrimSpace(line)) {
-	// 		case ".exit", ".quit":
-	// 			return true
-	// 		}
-	// 	}
-	// 	return false
-	// }
+func runSQL(x context.Context, w io.Writer, cmdPrefix, q string) {
+	if strings.EqualFold(cmdPrefix, "SELECT") {
+		runQuery(x, w, q)
+	} else {
+		runExec(x, w, cmdPrefix, q)
+	}
+}
 
-	// p := prompt.New(
-	// 	evalLine,
-	// 	completer,
-	// 	prompt.OptionSetExitCheckerOnInput(exitChecker),
-	// 	prompt.OptionLivePrefix(getLivePrefix),
-	// )
-	// p.Run()
+func runREPL(x context.Context, conn client.Conn) {
+	defer fmt.Println("")
 
-	prefix := "> "
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		fmt.Printf("%v\r\n", err)
+		return
+	}
+	defer term.Restore(fd, oldState)
+
+	rw := struct {
+		io.Reader
+		io.Writer
+	}{os.Stdin, os.Stdout}
+
+	prompt := ">> "
+	t := term.NewTerminal(rw, prompt)
+	h := newSimpleHistory()
+	t.History = h
+
+	fmt.Fprintln(t, "Welcome to Savage-DB CLI!")
+
+	buffer := []string{}
+
 	for {
-		content := prompt.Input(
-			prefix,
-			completer,
-			prompt.OptionHistory(history),
-			prompt.OptionLivePrefix(getLivePrefix),
-			prompt.OptionPrefix(prefix),
-			prompt.OptionPrefixTextColor(prompt.Blue),
-			prompt.OptionSwitchKeyBindMode(prompt.EmacsKeyBind),
-		)
-		content = strings.TrimSpace(strings.ToLower(content))
-		switch content {
-		case "exit", "quit":
-			return
+		line, err := t.ReadLine()
+		if err != nil {
+			if err == io.EOF {
+				break // Ctrl+D, Ctrl+C
+			}
+			fmt.Fprintf(t, "ReadLine: %v\r\n", err)
+			break
 		}
-		evalLine(content)
+
+		trimmedLine := strings.TrimSpace(line)
+		if trimmedLine == "" && len(buffer) == 0 {
+			continue
+		}
+
+		buffer = append(buffer, line)
+
+		// 检查语句是否以分号结尾
+		if strings.HasSuffix(trimmedLine, ";") {
+			q := strings.Join(buffer, " ")
+			h.add(q)
+
+			if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
+				st := stmts[0]
+				runSQL(x, t, st.cmd, q)
+			} else {
+				runSQL(x, t, "", q)
+			}
+
+			buffer = nil
+			t.SetPrompt(prompt)
+		} else {
+			// 没有遇到分号，说明是多行输入，更改提示符
+			t.SetPrompt("  ")
+		}
 	}
 }
 
