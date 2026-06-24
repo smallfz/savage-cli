@@ -3,9 +3,13 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"charm.land/bubbles/v2/textarea"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
 	"context"
 	"flag"
 	"fmt"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/rqlite/sql"
@@ -152,7 +156,7 @@ func parseSQLite(q string) ([]*stmtInfo, error) {
 	}
 	results := make([]*stmtInfo, len(sts3))
 	for i, t := range sts3 {
-		log.Debug(fmt.Sprintf("node: %T, %v", t, t))
+		// log.Debug(fmt.Sprintf("node: %T, %v", t, t))
 		cmd := ""
 		switch t.(type) {
 		case *sql.SelectStatement:
@@ -289,9 +293,9 @@ func main() {
 
 		fmt.Printf("connected as user %s.\r\n", conn.AuthInfo().User)
 
-		x = context.WithValue(x, "conn", conn)
+		x1 := context.WithValue(x, "conn", conn)
 
-		if fatal, err := runREPL(x, conn); err != nil {
+		if fatal, err := replv2(x1, conn); err != nil {
 			if fatal || !autoReconnect {
 				break
 			} else {
@@ -309,13 +313,13 @@ func runQuery(x context.Context, w io.Writer, q string) error {
 	conn := x.Value("conn").(client.Conn)
 	stmt, err := conn.PrepareStmt(x, q)
 	if err != nil {
-		fmt.Printf("prepare: %v\r\n", err)
+		fmt.Fprintf(w, "prepare: %v\r\n", err)
 		return err
 	}
 	defer stmt.Close()
 	rows, err := stmt.QueryWithArgs(x, nil)
 	if err != nil {
-		fmt.Printf("query: %v\r\n", err)
+		fmt.Fprintf(w, "query: %v\r\n", err)
 		return err
 	}
 	defer rows.Close()
@@ -327,18 +331,18 @@ func runExec(x context.Context, w io.Writer, cmdPrefix, q string) error {
 	conn := x.Value("conn").(client.Conn)
 	rs, err := conn.ExecWithArgs(x, q, nil)
 	if err != nil {
-		fmt.Printf("exec: %v\r\n", err)
+		fmt.Fprintf(w, "exec: %v\r\n", err)
 		return err
 	}
 	if len(cmdPrefix) == 0 {
-		fmt.Println("OK")
+		fmt.Fprintln(w, "OK")
 		return nil
 	}
 	if rc, err := rs.RowsAffected(); err != nil {
-		fmt.Printf("%s: ok\r\n", cmdPrefix)
+		fmt.Fprintf(w, "%s: ok\r\n", cmdPrefix)
 		return err
 	} else {
-		fmt.Printf("%s: %d\r\n", cmdPrefix, rc)
+		fmt.Fprintf(w, "%s: %d\r\n", cmdPrefix, rc)
 	}
 	return nil
 }
@@ -351,7 +355,7 @@ func runSQL(x context.Context, w io.Writer, cmdPrefix, q string) error {
 	}
 }
 
-func runREPL(x context.Context, conn client.Conn) (fatal bool, err error) {
+func replv1(x context.Context, conn client.Conn) (fatal bool, err error) {
 	defer fmt.Println("")
 
 	fd := int(os.Stdin.Fd())
@@ -425,6 +429,222 @@ func runREPL(x context.Context, conn client.Conn) (fatal bool, err error) {
 			t.SetPrompt("  ")
 		}
 	}
+}
+
+type replResult struct {
+	fatal bool
+	err   error
+}
+
+type tuiModel struct {
+	hist        *hist
+	histCur     int
+	vp          viewport.Model
+	text        textarea.Model
+	heightTotal int
+	ch          chan string
+	replResult  *replResult
+	chClose     chan byte
+}
+
+var _ tea.Model = (*tuiModel)(nil)
+
+func newTUIModel() *tuiModel {
+	ta := textarea.New()
+	ta.SetHeight(5)
+	ta.Placeholder = "SQL here... press Alt+Enter to submit."
+	ta.Focus()
+
+	vp := viewport.New(viewport.WithWidth(30), viewport.WithHeight(5))
+	vp.SetContent("Welcome to Savage-DB CLI!")
+	// vp.Style = lipgloss.NewStyle().
+	// 	BorderStyle(lipgloss.RoundedBorder()).
+	// 	BorderBottom(true)
+
+	return &tuiModel{
+		hist:    newSimpleHistory(),
+		vp:      vp,
+		text:    ta,
+		ch:      make(chan string),
+		chClose: make(chan byte, 1),
+	}
+}
+
+func (t *tuiModel) Init() tea.Cmd {
+	return tea.Batch(
+		textarea.Blink,
+		// tea.Println("press Ctrl+Q to exit."),
+		// tea.Println("press Alt+Enter to run SQL."),
+	)
+}
+
+func (t *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch m := msg.(type) {
+	case tea.WindowSizeMsg:
+		t.heightTotal = m.Height
+		t.text.SetWidth(m.Width)
+		t.vp.SetWidth(m.Width)
+		t.vp.SetHeight(m.Height - t.text.Height())
+		return t, nil
+	case tea.KeyMsg:
+		switch m.String() {
+		case "ctrl+q":
+			select {
+			case t.chClose <- 1:
+			default:
+			}
+			return t, tea.Quit
+		case "meta+enter", "alt+enter":
+			content := t.text.Value()
+			select {
+			case t.ch <- content:
+			default:
+				return t, nil
+			}
+			t.histCur = 0
+			t.vp.SetContent("")
+			t.text.Reset()
+			t.vp.GotoBottom()
+		case "up":
+			t.histCur += 1
+			t.text.SetValue(t.hist.At(t.histCur - 1))
+			return t, nil
+		case "down":
+			t.histCur -= 1
+			t.text.SetValue(t.hist.At(t.histCur - 1))
+			return t, nil
+		}
+	case tea.KeyPressMsg:
+		switch m.String() {
+		case "ctrl+r":
+			t.histCur = 0
+			content := t.text.Value()
+			t.vp.SetContent(content)
+			t.text.Reset()
+			t.vp.GotoBottom()
+			return t, nil
+		}
+	}
+	t.histCur = 0
+	ta, cmd := t.text.Update(msg)
+	t.text = ta
+	return t, cmd
+}
+
+func (t *tuiModel) View() tea.View {
+	// return tea.NewView()
+	return tea.NewView(t.vp.View() + "\n" + t.text.View())
+}
+
+func (t *tuiModel) handleSQL(x context.Context) {
+	for {
+		select {
+		case <-x.Done():
+			return
+		case <-t.chClose:
+			t.replResult = &replResult{fatal: true}
+			return
+		case q := <-t.ch:
+			switch q {
+			case "exit", "quit":
+				t.replResult = &replResult{fatal: true}
+				return
+			}
+			t.hist.add(removeCRLF(q))
+			if fatal, err := t.run(x, q); fatal {
+				t.replResult = &replResult{fatal: fatal, err: err}
+				return
+			}
+		}
+	}
+}
+
+func (t *tuiModel) run(x context.Context, q string) (fat bool, err error) {
+	buf := new(bytes.Buffer)
+	defer func() {
+		t.text.Reset()
+		content := string(buf.Bytes())
+		h := lipgloss.Height(content)
+		if h > t.heightTotal-t.text.Height() {
+			t.vp.SetHeight(h)
+		} else {
+			t.vp.SetHeight(t.heightTotal - t.text.Height())
+		}
+		t.vp.SetContent(content)
+		t.vp.GotoBottom()
+	}()
+	if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
+		st := stmts[0]
+		if err := runSQL(x, buf, st.cmd, q); err != nil {
+			if err == io.EOF {
+				return false, err
+			}
+		}
+	} else {
+		if err := runSQL(x, buf, "", q); err != nil {
+			if err == io.EOF {
+				return false, err
+			}
+		}
+	}
+	return false, nil
+}
+
+func replv2(x context.Context, conn client.Conn) (fatal bool, err error) {
+	x1, cancel := context.WithCancel(x)
+	defer cancel()
+
+	// defer fmt.Println("")
+
+	// t := os.Stdout
+	// fmt.Fprintln(t, "Welcome to Savage-DB CLI!")
+	mod := newTUIModel()
+	p := tea.NewProgram(mod)
+
+	go func() {
+		mod.handleSQL(x1)
+		p.Quit()
+	}()
+
+	if _, err := p.Run(); err != nil {
+		return true, err
+	}
+
+	if mod.replResult == nil {
+		return false, nil
+	}
+
+	return mod.replResult.fatal, mod.replResult.err
+
+	// for {
+	// 	q := ""
+	// 	// 检查语句是否以分号结尾
+	// 	if strings.HasSuffix(q, ";") {
+	// 		fmt.Fprintf(t, ">> %s\r\n", q)
+	// 		// h.add(q)
+
+	// 		if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
+	// 			st := stmts[0]
+	// 			if err := runSQL(x, t, st.cmd, q); err != nil {
+	// 				if err == io.EOF {
+	// 					return false, err
+	// 				}
+	// 			}
+	// 		} else {
+	// 			if err := runSQL(x, t, "", q); err != nil {
+	// 				if err == io.EOF {
+	// 					return false, err
+	// 				}
+	// 			}
+	// 		}
+
+	// 	} else {
+	// 		switch q {
+	// 		case "exit", "quit":
+	// 			return true, nil
+	// 		}
+	// 	}
+	// }
 }
 
 func recoverTerm() {
