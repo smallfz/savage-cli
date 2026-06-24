@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -16,15 +18,88 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
+)
+
+var (
+	autoReconnect = true
+	historyFile   = ".savage-history"
 )
 
 func init() {
 	table.StyleDefault.Format.Header = text.FormatDefault
 	table.StyleDefault.Format.HeaderAlign = text.AlignCenter
+}
+
+func readPersistedHistory() []string {
+	lines := []string{}
+	if loc, err := os.UserHomeDir(); err == nil {
+		fpath := filepath.Join(loc, historyFile)
+		if f, err := os.Open(fpath); err == nil {
+			defer f.Close()
+			delim := byte('\n')
+			r := bufio.NewReader(f)
+			for {
+				if lineb, err := r.ReadBytes(delim); err != nil {
+					break
+				} else {
+					lineb = bytes.TrimSpace(lineb)
+					if len(lineb) > 0 {
+						lines = append(lines, string(lineb))
+					}
+				}
+			}
+		}
+	}
+	return lines
+}
+
+var (
+	chHistNewLine = make(chan string, 32)
+)
+
+func persistHistoryLine(line string) {
+}
+
+func startHistoryAppender(x context.Context) {
+	pending := make([]string, 0, 32)
+
+	flush := func() {
+		if loc, err := os.UserHomeDir(); err == nil {
+			fpath := filepath.Join(loc, historyFile)
+			flg := os.O_APPEND | os.O_CREATE | os.O_WRONLY
+			if f, err := os.OpenFile(fpath, flg, 0600); err == nil {
+				defer f.Close()
+				for _, line := range pending {
+					fmt.Fprintf(f, "%s\n", line)
+				}
+			}
+		}
+		pending = pending[:0]
+	}
+
+	defer flush()
+
+	for {
+		select {
+		case <-x.Done():
+			return
+		case line := <-chHistNewLine:
+			pending = append(pending, line)
+			if len(pending) >= cap(pending) {
+				flush()
+			}
+		case <-time.After(time.Second):
+			if len(pending) > 0 {
+				flush()
+			}
+		}
+	}
 }
 
 type hist struct {
@@ -34,9 +109,10 @@ type hist struct {
 var _ term.History = (*hist)(nil)
 
 func newSimpleHistory() *hist {
-	return &hist{
-		lines: []string{},
+	h := &hist{
+		lines: readPersistedHistory(),
 	}
+	return h
 }
 
 func (h *hist) Add(line string) {
@@ -44,6 +120,10 @@ func (h *hist) Add(line string) {
 
 func (h *hist) add(line string) {
 	h.lines = append(h.lines, removeCRLF(line))
+	select {
+	case chHistNewLine <- line:
+	case <-time.After(time.Second):
+	}
 }
 
 func (h *hist) Len() int {
@@ -125,7 +205,7 @@ type conf struct {
 	pwd string
 }
 
-func makeConnFromOSArgs(x context.Context) (client.Conn, error) {
+func parseConf() (*conf, error) {
 	cfg := &conf{
 		uri: "wss://root@localhost:3099/demo",
 	}
@@ -164,6 +244,16 @@ func makeConnFromOSArgs(x context.Context) (client.Conn, error) {
 		cfg.uid = uid
 	}
 
+	cfg.uri = uri.String()
+
+	return cfg, nil
+}
+
+func makeConn(x context.Context, cfg *conf) (client.Conn, error) {
+	uri, err := url.Parse(cfg.uri)
+	if err != nil {
+		return nil, err
+	}
 	fmt.Printf("Connecting to %s@%s...\r\n", cfg.uid, uri.Hostname())
 	conn, err := client.Open(uri.String())
 	if err != nil {
@@ -179,73 +269,96 @@ func main() {
 
 	log.SetLevel(slog.LevelWarn)
 
+	cfg, err := parseConf()
+	if err != nil {
+		fmt.Printf("%v\r\n", err)
+		return
+	}
+
 	x, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	conn, err := makeConnFromOSArgs(x)
-	if err != nil {
-		return
+	go startHistoryAppender(x)
+
+	for {
+		conn, err := makeConn(x, cfg)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		fmt.Printf("connected as user %s.\r\n", conn.AuthInfo().User)
+
+		x = context.WithValue(x, "conn", conn)
+
+		if fatal, err := runREPL(x, conn); err != nil {
+			if fatal || !autoReconnect {
+				break
+			} else {
+				fmt.Println("try reconnecting...")
+			}
+		} else {
+			if fatal {
+				break
+			}
+		}
 	}
-	defer conn.Close()
-
-	fmt.Printf("connected as user %s.\r\n", conn.AuthInfo().User)
-
-	x = context.WithValue(x, "conn", conn)
-
-	runREPL(x, conn)
 }
 
-func runQuery(x context.Context, w io.Writer, q string) {
+func runQuery(x context.Context, w io.Writer, q string) error {
 	conn := x.Value("conn").(client.Conn)
 	stmt, err := conn.PrepareStmt(x, q)
 	if err != nil {
 		fmt.Printf("prepare: %v\r\n", err)
-		return
+		return err
 	}
 	defer stmt.Close()
 	rows, err := stmt.QueryWithArgs(x, nil)
 	if err != nil {
 		fmt.Printf("query: %v\r\n", err)
-		return
+		return err
 	}
 	defer rows.Close()
 	printRows(w, rows)
+	return nil
 }
 
-func runExec(x context.Context, w io.Writer, cmdPrefix, q string) {
+func runExec(x context.Context, w io.Writer, cmdPrefix, q string) error {
 	conn := x.Value("conn").(client.Conn)
 	rs, err := conn.ExecWithArgs(x, q, nil)
 	if err != nil {
 		fmt.Printf("exec: %v\r\n", err)
-		return
+		return err
 	}
 	if len(cmdPrefix) == 0 {
 		fmt.Println("OK")
-		return
+		return nil
 	}
 	if rc, err := rs.RowsAffected(); err != nil {
 		fmt.Printf("%s: ok\r\n", cmdPrefix)
+		return err
 	} else {
 		fmt.Printf("%s: %d\r\n", cmdPrefix, rc)
 	}
+	return nil
 }
 
-func runSQL(x context.Context, w io.Writer, cmdPrefix, q string) {
+func runSQL(x context.Context, w io.Writer, cmdPrefix, q string) error {
 	if strings.EqualFold(cmdPrefix, "SELECT") {
-		runQuery(x, w, q)
+		return runQuery(x, w, q)
 	} else {
-		runExec(x, w, cmdPrefix, q)
+		return runExec(x, w, cmdPrefix, q)
 	}
 }
 
-func runREPL(x context.Context, conn client.Conn) {
+func runREPL(x context.Context, conn client.Conn) (fatal bool, err error) {
 	defer fmt.Println("")
 
 	fd := int(os.Stdin.Fd())
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
 		fmt.Printf("%v\r\n", err)
-		return
+		return true, err
 	}
 	defer term.Restore(fd, oldState)
 
@@ -267,10 +380,11 @@ func runREPL(x context.Context, conn client.Conn) {
 		line, err := t.ReadLine()
 		if err != nil {
 			if err == io.EOF {
-				break // Ctrl+D, Ctrl+C
+				// break // Ctrl+D, Ctrl+C
 			}
 			fmt.Fprintf(t, "ReadLine: %v\r\n", err)
-			break
+			// break
+			return true, nil
 		}
 
 		trimmedLine := strings.TrimSpace(line)
@@ -287,14 +401,26 @@ func runREPL(x context.Context, conn client.Conn) {
 
 			if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
 				st := stmts[0]
-				runSQL(x, t, st.cmd, q)
+				if err := runSQL(x, t, st.cmd, q); err != nil {
+					if err == io.EOF {
+						return false, err
+					}
+				}
 			} else {
-				runSQL(x, t, "", q)
+				if err := runSQL(x, t, "", q); err != nil {
+					if err == io.EOF {
+						return false, err
+					}
+				}
 			}
 
 			buffer = nil
 			t.SetPrompt(prompt)
 		} else {
+			switch trimmedLine {
+			case "exit", "quit":
+				return true, nil
+			}
 			// 没有遇到分号，说明是多行输入，更改提示符
 			t.SetPrompt("  ")
 		}
