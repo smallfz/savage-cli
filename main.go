@@ -6,10 +6,12 @@ import (
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	lgtable "charm.land/lipgloss/v2/table"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/rqlite/sql"
@@ -53,9 +55,14 @@ func readPersistedHistory() []string {
 					break
 				} else {
 					lineb = bytes.TrimSpace(lineb)
-					if len(lineb) > 0 {
-						lines = append(lines, string(lineb))
+					if len(lineb) <= 0 {
+						continue
 					}
+					line := ""
+					if err := json.Unmarshal(lineb, &line); err != nil {
+						line = string(lineb)
+					}
+					lines = append(lines, line)
 				}
 			}
 		}
@@ -66,9 +73,6 @@ func readPersistedHistory() []string {
 var (
 	chHistNewLine = make(chan string, 32)
 )
-
-func persistHistoryLine(line string) {
-}
 
 func startHistoryAppender(x context.Context) {
 	pending := make([]string, 0, 32)
@@ -123,10 +127,12 @@ func (h *hist) Add(line string) {
 }
 
 func (h *hist) add(line string) {
-	h.lines = append(h.lines, removeCRLF(line))
-	select {
-	case chHistNewLine <- line:
-	case <-time.After(time.Second):
+	h.lines = append(h.lines, line)
+	if dat, err := json.Marshal(line); err == nil {
+		select {
+		case chHistNewLine <- string(dat):
+		case <-time.After(time.Second):
+		}
 	}
 }
 
@@ -174,7 +180,7 @@ func parseSQLite(q string) ([]*stmtInfo, error) {
 	return results, nil
 }
 
-func printRows(w io.Writer, rows client.Rows) {
+func printRowsLegacy(w io.Writer, rows client.Rows) {
 	cols := rows.Columns()
 	tw := table.NewWriter()
 
@@ -196,6 +202,28 @@ func printRows(w io.Writer, rows client.Rows) {
 		tw.AppendRows([]table.Row{trow})
 	}
 	fmt.Fprintln(w, tw.Render())
+}
+
+func printRows(w io.Writer, rows client.Rows) {
+	cols := rows.Columns()
+	tbl := lgtable.New().Headers(cols...)
+
+	for {
+		row := make([]any, len(cols))
+		if err := rows.NextRow(row); err != nil {
+			break
+		}
+		texts := make([]string, len(row))
+		for i, v := range row {
+			if s, ok := v.(fmt.Stringer); ok {
+				texts[i] = s.String()
+			} else {
+				texts[i] = fmt.Sprintf("%v", v)
+			}
+		}
+		tbl.Row(texts...)
+	}
+	fmt.Fprintln(w, tbl.Render())
 }
 
 func removeCRLF(text string) string {
@@ -436,10 +464,18 @@ type replResult struct {
 	err   error
 }
 
+var (
+	borderStyle = lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("62"))
+	grayText = lipgloss.NewStyle().Foreground(lipgloss.Color("103"))
+)
+
 type tuiModel struct {
 	hist        *hist
 	histCur     int
 	vp          viewport.Model
+	scrollTop   int
 	text        textarea.Model
 	heightTotal int
 	ch          chan string
@@ -452,14 +488,14 @@ var _ tea.Model = (*tuiModel)(nil)
 func newTUIModel() *tuiModel {
 	ta := textarea.New()
 	ta.SetHeight(5)
-	ta.Placeholder = "SQL here... press Alt+Enter to submit."
+	ta.Placeholder = "Alt+Enter to run SQL..."
 	ta.Focus()
 
 	vp := viewport.New(viewport.WithWidth(30), viewport.WithHeight(5))
-	vp.SetContent("Welcome to Savage-DB CLI!")
-	// vp.Style = lipgloss.NewStyle().
-	// 	BorderStyle(lipgloss.RoundedBorder()).
-	// 	BorderBottom(true)
+	welcome := " Welcome to Savage-DB CLI!\n " + grayText.Render("Ctrl+Q to exit.")
+	vp.SetContent(welcome)
+	vp.MouseWheelEnabled = true
+	vp.SoftWrap = true
 
 	return &tuiModel{
 		hist:    newSimpleHistory(),
@@ -473,19 +509,21 @@ func newTUIModel() *tuiModel {
 func (t *tuiModel) Init() tea.Cmd {
 	return tea.Batch(
 		textarea.Blink,
-		// tea.Println("press Ctrl+Q to exit."),
-		// tea.Println("press Alt+Enter to run SQL."),
 	)
 }
 
 func (t *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	routeToVp := false
 	switch m := msg.(type) {
 	case tea.WindowSizeMsg:
 		t.heightTotal = m.Height
-		t.text.SetWidth(m.Width)
-		t.vp.SetWidth(m.Width)
-		t.vp.SetHeight(m.Height - t.text.Height())
+		t.text.SetWidth(m.Width - 2)
+		t.vp.SetWidth(m.Width - 2)
+		t.vp.SetHeight(m.Height - t.text.Height() - 2)
+		t.vp.GotoBottom()
 		return t, nil
+	case tea.MouseWheelMsg:
+		routeToVp = true
 	case tea.KeyMsg:
 		switch m.String() {
 		case "ctrl+q":
@@ -502,17 +540,22 @@ func (t *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return t, nil
 			}
 			t.histCur = 0
-			t.vp.SetContent("")
-			t.text.Reset()
-			t.vp.GotoBottom()
+			return t, nil
 		case "up":
 			t.histCur += 1
+			// t.vp.SetContent(fmt.Sprintf("histCur: %d", t.histCur))
 			t.text.SetValue(t.hist.At(t.histCur - 1))
 			return t, nil
 		case "down":
 			t.histCur -= 1
+			if t.histCur < 0 {
+				t.histCur = 0
+			}
+			// t.vp.SetContent(fmt.Sprintf("histCur: %d", t.histCur))
 			t.text.SetValue(t.hist.At(t.histCur - 1))
 			return t, nil
+		default:
+			t.histCur = 0
 		}
 	case tea.KeyPressMsg:
 		switch m.String() {
@@ -525,15 +568,33 @@ func (t *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return t, nil
 		}
 	}
-	t.histCur = 0
-	ta, cmd := t.text.Update(msg)
-	t.text = ta
-	return t, cmd
+
+	cmds := []tea.Cmd{}
+	if routeToVp {
+		if vp, cmd := t.vp.Update(msg); true {
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			t.vp = vp
+		}
+	} else {
+		if txt, cmd := t.text.Update(msg); true {
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			t.text = txt
+		}
+	}
+
+	return t, tea.Batch(cmds...)
 }
 
 func (t *tuiModel) View() tea.View {
 	// return tea.NewView()
-	return tea.NewView(t.vp.View() + "\n" + t.text.View())
+	vpView := borderStyle.Render(t.vp.View())
+	v := tea.NewView(vpView + "\n" + t.text.View())
+	v.MouseMode = tea.MouseModeAllMotion
+	return v
 }
 
 func (t *tuiModel) handleSQL(x context.Context) {
@@ -550,7 +611,7 @@ func (t *tuiModel) handleSQL(x context.Context) {
 				t.replResult = &replResult{fatal: true}
 				return
 			}
-			t.hist.add(removeCRLF(q))
+			t.hist.add(q)
 			if fatal, err := t.run(x, q); fatal {
 				t.replResult = &replResult{fatal: fatal, err: err}
 				return
@@ -559,20 +620,44 @@ func (t *tuiModel) handleSQL(x context.Context) {
 	}
 }
 
-func (t *tuiModel) run(x context.Context, q string) (fat bool, err error) {
+func (t *tuiModel) run(x0 context.Context, q string) (fat bool, err error) {
 	buf := new(bytes.Buffer)
+
 	defer func() {
 		t.text.Reset()
 		content := string(buf.Bytes())
-		h := lipgloss.Height(content)
-		if h > t.heightTotal-t.text.Height() {
-			t.vp.SetHeight(h)
-		} else {
-			t.vp.SetHeight(t.heightTotal - t.text.Height())
-		}
 		t.vp.SetContent(content)
-		t.vp.GotoBottom()
+		// h := lipgloss.Height(content)
+		// if h > t.heightTotal-t.text.Height() {
+		// 	// t.vp.SetHeight(h)
+		// 	t.vp.SetHeight(t.heightTotal - t.text.Height())
+		// } else {
+		// 	t.vp.SetHeight(t.heightTotal - t.text.Height())
+		// }
+		t.vp.GotoTop()
 	}()
+
+	x, cancel := context.WithCancel(x0)
+	defer cancel()
+
+	go func() {
+		/* loading spinner */
+		i := 0
+		runes := []rune("|/-\\")
+		size := len(runes)
+		for {
+			select {
+			case <-x.Done():
+				return
+			case <-time.After(time.Millisecond * 150):
+				offset := i % size
+				content := string(runes[offset : offset+1])
+				t.vp.SetContent(grayText.Render(content))
+				i += 1
+			}
+		}
+	}()
+
 	if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
 		st := stmts[0]
 		if err := runSQL(x, buf, st.cmd, q); err != nil {
@@ -594,10 +679,6 @@ func replv2(x context.Context, conn client.Conn) (fatal bool, err error) {
 	x1, cancel := context.WithCancel(x)
 	defer cancel()
 
-	// defer fmt.Println("")
-
-	// t := os.Stdout
-	// fmt.Fprintln(t, "Welcome to Savage-DB CLI!")
 	mod := newTUIModel()
 	p := tea.NewProgram(mod)
 
@@ -615,36 +696,6 @@ func replv2(x context.Context, conn client.Conn) (fatal bool, err error) {
 	}
 
 	return mod.replResult.fatal, mod.replResult.err
-
-	// for {
-	// 	q := ""
-	// 	// 检查语句是否以分号结尾
-	// 	if strings.HasSuffix(q, ";") {
-	// 		fmt.Fprintf(t, ">> %s\r\n", q)
-	// 		// h.add(q)
-
-	// 		if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
-	// 			st := stmts[0]
-	// 			if err := runSQL(x, t, st.cmd, q); err != nil {
-	// 				if err == io.EOF {
-	// 					return false, err
-	// 				}
-	// 			}
-	// 		} else {
-	// 			if err := runSQL(x, t, "", q); err != nil {
-	// 				if err == io.EOF {
-	// 					return false, err
-	// 				}
-	// 			}
-	// 		}
-
-	// 	} else {
-	// 		switch q {
-	// 		case "exit", "quit":
-	// 			return true, nil
-	// 		}
-	// 	}
-	// }
 }
 
 func recoverTerm() {
