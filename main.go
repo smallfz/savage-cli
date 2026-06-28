@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/huh/v2"
 	"charm.land/lipgloss/v2"
 	lgtable "charm.land/lipgloss/v2/table"
 	"context"
@@ -145,6 +147,19 @@ func (h *hist) At(i int) string {
 		return h.lines[len(h.lines)-1-i]
 	}
 	return ""
+}
+
+func (h *hist) last10() []string {
+	start := len(h.lines) - 10
+	if start < 0 {
+		start = 0
+	}
+	lasts := h.lines[start:]
+	out := make([]string, len(lasts))
+	for i, line := range lasts {
+		out[len(out)-i-1] = line
+	}
+	return out
 }
 
 type stmtInfo struct {
@@ -323,7 +338,7 @@ func main() {
 
 		x1 := context.WithValue(x, "conn", conn)
 
-		if fatal, err := replv2(x1, conn); err != nil {
+		if fatal, err := replv3(x1, conn); err != nil {
 			if fatal || !autoReconnect {
 				break
 			} else {
@@ -457,6 +472,76 @@ func replv1(x context.Context, conn client.Conn) (fatal bool, err error) {
 			t.SetPrompt("  ")
 		}
 	}
+}
+
+func replv3(x context.Context, conn client.Conn) (fatal bool, err error) {
+	defer fmt.Println("")
+
+	h := newSimpleHistory()
+	t := os.Stdout
+
+	km := huh.NewDefaultKeyMap()
+	km.Quit = key.NewBinding(key.WithKeys("ctrl+d"))
+	km.Input.AcceptSuggestion = key.NewBinding(key.WithKeys("tab"))
+
+	lines := []string{}
+	for {
+		line := ""
+
+		input := huh.NewInput().Value(&line)
+		if len(lines) == 0 {
+			input = input.Prompt("> ")
+		} else {
+			input = input.Prompt(">>> ")
+		}
+
+		input.SuggestionsFunc(func() []string {
+			return h.last10()
+		}, nil)
+
+		form := huh.NewForm(huh.NewGroup(input)).WithKeyMap(km)
+		if err := form.Run(); err != nil {
+			fmt.Fprintf(t, "form.Run: %v\r\n", err)
+			return true, nil
+		}
+
+		// input.WithKeyMap(km)
+		// input.Run()
+
+		line = strings.TrimSpace(removeCRLF(line))
+
+		switch line {
+		case "exit", "quit":
+			return true, nil
+		}
+
+		if len(line) > 0 {
+			lines = append(lines, line)
+			fmt.Fprintf(t, "%s\r\n", line)
+		}
+
+		if strings.HasSuffix(line, ";") {
+			q := strings.Join(lines, " ")
+			lines = lines[:0]
+			h.add(q)
+			/* run the SQL. */
+			if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
+				st := stmts[0]
+				if err := runSQL(x, t, st.cmd, q); err != nil {
+					if err == io.EOF {
+						return false, err
+					}
+				}
+			} else {
+				if err := runSQL(x, t, "", q); err != nil {
+					if err == io.EOF {
+						return false, err
+					}
+				}
+			}
+		}
+	}
+	return true, nil
 }
 
 type replResult struct {
