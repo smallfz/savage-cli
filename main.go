@@ -492,7 +492,7 @@ func replv3(x context.Context, conn client.Conn) (fatal bool, err error) {
 		if len(lines) == 0 {
 			input = input.Prompt("> ")
 		} else {
-			input = input.Prompt(">>> ")
+			input = input.Prompt("> ")
 		}
 
 		input.SuggestionsFunc(func() []string {
@@ -501,12 +501,8 @@ func replv3(x context.Context, conn client.Conn) (fatal bool, err error) {
 
 		form := huh.NewForm(huh.NewGroup(input)).WithKeyMap(km)
 		if err := form.Run(); err != nil {
-			fmt.Fprintf(t, "form.Run: %v\r\n", err)
 			return true, nil
 		}
-
-		// input.WithKeyMap(km)
-		// input.Run()
 
 		line = strings.TrimSpace(removeCRLF(line))
 
@@ -517,7 +513,7 @@ func replv3(x context.Context, conn client.Conn) (fatal bool, err error) {
 
 		if len(line) > 0 {
 			lines = append(lines, line)
-			fmt.Fprintf(t, "%s\r\n", line)
+			fmt.Fprintf(t, ">> %s\r\n", line)
 		}
 
 		if strings.HasSuffix(line, ";") {
