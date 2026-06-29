@@ -338,7 +338,7 @@ func main() {
 
 		x1 := context.WithValue(x, "conn", conn)
 
-		if fatal, err := replv3(x1, conn); err != nil {
+		if fatal, err := replv4(x1, conn); err != nil {
 			if fatal || !autoReconnect {
 				break
 			} else {
@@ -472,72 +472,6 @@ func replv1(x context.Context, conn client.Conn) (fatal bool, err error) {
 			t.SetPrompt("  ")
 		}
 	}
-}
-
-func replv3(x context.Context, conn client.Conn) (fatal bool, err error) {
-	defer fmt.Println("")
-
-	h := newSimpleHistory()
-	t := os.Stdout
-
-	km := huh.NewDefaultKeyMap()
-	km.Quit = key.NewBinding(key.WithKeys("ctrl+d"))
-	km.Input.AcceptSuggestion = key.NewBinding(key.WithKeys("tab"))
-
-	lines := []string{}
-	for {
-		line := ""
-
-		input := huh.NewInput().Value(&line)
-		if len(lines) == 0 {
-			input = input.Prompt("> ")
-		} else {
-			input = input.Prompt("> ")
-		}
-
-		input.SuggestionsFunc(func() []string {
-			return h.last10()
-		}, nil)
-
-		form := huh.NewForm(huh.NewGroup(input)).WithKeyMap(km)
-		if err := form.Run(); err != nil {
-			return true, nil
-		}
-
-		line = strings.TrimSpace(removeCRLF(line))
-
-		switch line {
-		case "exit", "quit":
-			return true, nil
-		}
-
-		if len(line) > 0 {
-			lines = append(lines, line)
-			fmt.Fprintf(t, ">> %s\r\n", line)
-		}
-
-		if strings.HasSuffix(line, ";") {
-			q := strings.Join(lines, " ")
-			lines = lines[:0]
-			h.add(q)
-			/* run the SQL. */
-			if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
-				st := stmts[0]
-				if err := runSQL(x, t, st.cmd, q); err != nil {
-					if err == io.EOF {
-						return false, err
-					}
-				}
-			} else {
-				if err := runSQL(x, t, "", q); err != nil {
-					if err == io.EOF {
-						return false, err
-					}
-				}
-			}
-		}
-	}
-	return true, nil
 }
 
 type replResult struct {
@@ -777,6 +711,158 @@ func replv2(x context.Context, conn client.Conn) (fatal bool, err error) {
 	}
 
 	return mod.replResult.fatal, mod.replResult.err
+}
+
+func replv3(x context.Context, conn client.Conn) (fatal bool, err error) {
+	defer fmt.Println("")
+
+	h := newSimpleHistory()
+	t := os.Stdout
+
+	km := huh.NewDefaultKeyMap()
+	km.Quit = key.NewBinding(key.WithKeys("ctrl+q"))
+	km.Input.AcceptSuggestion = key.NewBinding(key.WithKeys("tab"))
+	km.Text.NewLine = key.NewBinding(key.WithKeys(
+		"shift-enter", "ctrl+j", "alt+enter",
+	))
+	km.Text.Submit = key.NewBinding(key.WithKeys("enter"))
+
+	// lines := []string{}
+	for {
+		line := ""
+
+		// input := huh.NewInput().Value(&line)
+		// if len(lines) == 0 {
+		// 	input = input.Prompt("> ")
+		// } else {
+		// 	input = input.Prompt("> ")
+		// }
+		// input.SuggestionsFunc(func() []string {
+		// 	return h.last10()
+		// }, nil)
+
+		input := huh.NewText().
+			ExternalEditor(false).
+			Placeholder("").
+			Lines(4).
+			Value(&line)
+
+		form := huh.NewForm(huh.NewGroup(input)).WithKeyMap(km)
+		if err := form.Run(); err != nil {
+			return true, nil
+		}
+
+		line = strings.TrimSpace(removeCRLF(line))
+
+		switch line {
+		case "exit", "quit":
+			return true, nil
+		}
+
+		if len(line) > 0 {
+			// lines = append(lines, line)
+			fmt.Fprintf(t, ">> %s\r\n", line)
+		}
+
+		if true || strings.HasSuffix(line, ";") {
+			// q := strings.Join(lines, " ")
+			q := line
+			// lines = lines[:0]
+			h.add(q)
+			/* run the SQL. */
+			if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
+				st := stmts[0]
+				if err := runSQL(x, t, st.cmd, q); err != nil {
+					if err == io.EOF {
+						return false, err
+					}
+				}
+			} else {
+				if err := runSQL(x, t, "", q); err != nil {
+					if err == io.EOF {
+						return false, err
+					}
+				}
+			}
+		}
+	}
+	return true, nil
+}
+
+func replv4(x context.Context, conn client.Conn) (fatal bool, err error) {
+	t := os.Stdout
+	fmt.Fprintln(t, grayText.Render("ctrl+q to exit."))
+	fmt.Fprintln(t, grayText.Render(
+		"alt+up/down to load/nav history query.",
+	))
+
+	h := newSimpleHistory()
+
+	km := huh.NewDefaultKeyMap()
+	km.Quit = key.NewBinding(key.WithKeys("ctrl+q"))
+	km.Input.AcceptSuggestion = key.NewBinding(key.WithKeys("tab"))
+	km.Text.NewLine = key.NewBinding(key.WithKeys(
+		"shift-enter", "ctrl+j", "alt+enter",
+	))
+	km.Text.Submit = key.NewBinding(key.WithKeys("enter"))
+
+	for {
+		ta := &textAccessor{}
+
+		text := huh.NewText().
+			ExternalEditor(false).
+			Lines(4).
+			Accessor(ta)
+
+		form := huh.NewForm(huh.NewGroup(text)).
+			WithKeyMap(km).
+			WithShowErrors(true)
+
+		mod := newTUIModelV4(h, form, text, ta)
+		p := tea.NewProgram(mod)
+
+		if model, err := p.Run(); err != nil {
+			return true, err
+		} else if t, ok := model.(*tuiModelV4); ok {
+			if t.quit {
+				return true, nil
+			}
+		}
+
+		line := ta.Get()
+		line = strings.TrimSpace(removeCRLF(line))
+
+		if len(line) == 0 {
+			continue
+		} else {
+			fmt.Fprintf(t, ">> %s\r\n", line)
+		}
+
+		switch line {
+		case "exit", "quit":
+			return true, nil
+		}
+
+		if true || strings.HasSuffix(line, ";") {
+			q := line
+			h.add(q)
+			/* run the SQL. */
+			if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
+				st := stmts[0]
+				if err := runSQL(x, t, st.cmd, q); err != nil {
+					if err == io.EOF {
+						return false, err
+					}
+				}
+			} else {
+				if err := runSQL(x, t, "", q); err != nil {
+					if err == io.EOF {
+						return false, err
+					}
+				}
+			}
+		}
+	}
 }
 
 func recoverTerm() {
