@@ -25,22 +25,18 @@ type tuiModelV4 struct {
 	form       *huh.Form
 	text       *huh.Text
 	ta         *textAccessor
-	ch         chan string
-	replResult *replResult
-	chClose    chan byte
 	quit       bool
+	hotContent string
 }
 
 var _ tea.Model = (*tuiModelV4)(nil)
 
 func newTUIModelV4(h *hist, form *huh.Form, text *huh.Text, ta *textAccessor) *tuiModelV4 {
 	return &tuiModelV4{
-		hist:    h,
-		form:    form,
-		text:    text,
-		ta:      ta,
-		ch:      make(chan string),
-		chClose: make(chan byte, 1),
+		hist: h,
+		form: form,
+		text: text,
+		ta:   ta,
 	}
 }
 
@@ -55,21 +51,31 @@ func (t *tuiModelV4) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+q":
 			t.quit = true
 			return t, tea.Quit
-		case "alt+up":
+		case "up":
+			if t.histCur == 0 {
+				content := t.ta.Get()
+				t.hotContent = content
+			}
 			t.histCur += 1
 			t.ta.Set(t.hist.At(t.histCur - 1))
 			t.text.Accessor(t.ta)
-			return t, nil
-		case "alt+down":
+			// return t, nil
+		case "down":
 			t.histCur -= 1
-			if t.histCur < 0 {
+			if t.histCur <= 0 {
 				t.histCur = 0
 			}
-			t.ta.Set(t.hist.At(t.histCur - 1))
+			if t.histCur <= 0 {
+				t.ta.Set(t.hotContent)
+			} else {
+				content := t.hist.At(t.histCur - 1)
+				t.ta.Set(content)
+			}
 			t.text.Accessor(t.ta)
-			return t, nil
+			// return t, nil
 		default:
 			t.histCur = 0
+			t.hotContent = ""
 		}
 	}
 

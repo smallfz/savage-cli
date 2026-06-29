@@ -792,9 +792,6 @@ func replv3(x context.Context, conn client.Conn) (fatal bool, err error) {
 func replv4(x context.Context, conn client.Conn) (fatal bool, err error) {
 	t := os.Stdout
 	fmt.Fprintln(t, grayText.Render("ctrl+q to exit."))
-	fmt.Fprintln(t, grayText.Render(
-		"alt+up/down to load/nav history query.",
-	))
 
 	h := newSimpleHistory()
 
@@ -830,12 +827,12 @@ func replv4(x context.Context, conn client.Conn) (fatal bool, err error) {
 		}
 
 		line := ta.Get()
-		line = strings.TrimSpace(removeCRLF(line))
+		line = strings.TrimSpace(line)
 
 		if len(line) == 0 {
 			continue
 		} else {
-			fmt.Fprintf(t, ">> %s\r\n", line)
+			fmt.Fprintf(t, ">> %s\r\n", removeCRLF(line))
 		}
 
 		switch line {
