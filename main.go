@@ -180,6 +180,8 @@ func parseSQLite(q string) ([]*stmtInfo, error) {
 		// log.Debug(fmt.Sprintf("node: %T, %v", t, t))
 		cmd := ""
 		switch t.(type) {
+		case *sql.ExplainStatement:
+			cmd = "EXPLAIN"
 		case *sql.SelectStatement:
 			cmd = "SELECT"
 		case *sql.DeleteStatement:
@@ -392,6 +394,8 @@ func runExec(x context.Context, w io.Writer, cmdPrefix, q string) error {
 
 func runSQL(x context.Context, w io.Writer, cmdPrefix, q string) error {
 	if strings.EqualFold(cmdPrefix, "SELECT") {
+		return runQuery(x, w, q)
+	} else if strings.EqualFold(cmdPrefix, "EXPLAIN") {
 		return runQuery(x, w, q)
 	} else {
 		return runExec(x, w, cmdPrefix, q)
@@ -840,22 +844,20 @@ func replv4(x context.Context, conn client.Conn) (fatal bool, err error) {
 			return true, nil
 		}
 
-		if true || strings.HasSuffix(line, ";") {
-			q := line
-			h.add(q)
-			/* run the SQL. */
-			if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
-				st := stmts[0]
-				if err := runSQL(x, t, st.cmd, q); err != nil {
-					if err == io.EOF {
-						return false, err
-					}
+		q := line
+		h.add(q)
+		/* run the SQL. */
+		if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
+			st := stmts[0]
+			if err := runSQL(x, t, st.cmd, q); err != nil {
+				if err == io.EOF {
+					return false, err
 				}
-			} else {
-				if err := runSQL(x, t, "", q); err != nil {
-					if err == io.EOF {
-						return false, err
-					}
+			}
+		} else {
+			if err := runSQL(x, t, "", q); err != nil {
+				if err == io.EOF {
+					return false, err
 				}
 			}
 		}
