@@ -162,6 +162,16 @@ func (h *hist) last10() []string {
 	return out
 }
 
+func isIOEndErr(err error) bool {
+	if err != nil {
+		switch err {
+		case io.EOF, io.ErrClosedPipe:
+			return true
+		}
+	}
+	return false
+}
+
 type stmtInfo struct {
 	cmd     string
 	dml     bool
@@ -173,13 +183,16 @@ func parseSQLite(q string) ([]*stmtInfo, error) {
 	parser := sql.NewParser(src)
 	sts3, err := parser.ParseStatements()
 	if err != nil {
+		// fmt.Fprintf(os.Stderr, "parseStatements: %v\r\n", err)
 		return nil, err
 	}
 	results := make([]*stmtInfo, len(sts3))
 	for i, t := range sts3 {
-		// log.Debug(fmt.Sprintf("node: %T, %v", t, t))
+		// fmt.Fprintf(os.Stderr, "node: %T, %v\r\n", t, t)
 		cmd := ""
 		switch t.(type) {
+		case *sql.AnalyzeStatement:
+			cmd = "ANALYZE"
 		case *sql.ExplainStatement:
 			cmd = "EXPLAIN"
 		case *sql.SelectStatement:
@@ -221,9 +234,11 @@ func printRowsLegacy(w io.Writer, rows client.Rows) {
 	fmt.Fprintln(w, tw.Render())
 }
 
-func printRows(w io.Writer, rows client.Rows) {
+func printRows(w io.Writer, rows client.Rows) int {
 	cols := rows.Columns()
 	tbl := lgtable.New().Headers(cols...)
+
+	count := 0
 
 	for {
 		row := make([]any, len(cols))
@@ -239,8 +254,11 @@ func printRows(w io.Writer, rows client.Rows) {
 			}
 		}
 		tbl.Row(texts...)
+		count += 1
 	}
 	fmt.Fprintln(w, tbl.Render())
+
+	return count
 }
 
 func removeCRLF(text string) string {
@@ -356,48 +374,63 @@ func main() {
 
 func runQuery(x context.Context, w io.Writer, q string) error {
 	conn := x.Value("conn").(client.Conn)
+
+	t0 := time.Now()
+
 	stmt, err := conn.PrepareStmt(x, q)
 	if err != nil {
-		fmt.Fprintf(w, "prepare: %v\r\n", err)
+		fmt.Fprintf(w, "prepare: %T,%v\r\n", err, err)
 		return err
 	}
 	defer stmt.Close()
+
 	rows, err := stmt.QueryWithArgs(x, nil)
 	if err != nil {
 		fmt.Fprintf(w, "query: %v\r\n", err)
 		return err
 	}
 	defer rows.Close()
-	printRows(w, rows)
+
+	rowsCount := printRows(w, rows)
+
+	dur := time.Now().Sub(t0)
+	remark := grayText.Render(fmt.Sprintf(
+		"(%d rows in %s)", rowsCount, dur,
+	))
+	fmt.Fprintln(w, remark)
+
 	return nil
 }
 
 func runExec(x context.Context, w io.Writer, cmdPrefix, q string) error {
 	conn := x.Value("conn").(client.Conn)
+
 	rs, err := conn.ExecWithArgs(x, q, nil)
 	if err != nil {
 		fmt.Fprintf(w, "exec: %v\r\n", err)
 		return err
 	}
+
 	if len(cmdPrefix) == 0 {
 		fmt.Fprintln(w, "OK")
 		return nil
 	}
+
 	if rc, err := rs.RowsAffected(); err != nil {
 		fmt.Fprintf(w, "%s: ok\r\n", cmdPrefix)
 		return err
 	} else {
 		fmt.Fprintf(w, "%s: %d\r\n", cmdPrefix, rc)
 	}
+
 	return nil
 }
 
 func runSQL(x context.Context, w io.Writer, cmdPrefix, q string) error {
-	if strings.EqualFold(cmdPrefix, "SELECT") {
+	switch strings.ToUpper(cmdPrefix) {
+	case "SELECT", "EXPLAIN":
 		return runQuery(x, w, q)
-	} else if strings.EqualFold(cmdPrefix, "EXPLAIN") {
-		return runQuery(x, w, q)
-	} else {
+	default:
 		return runExec(x, w, cmdPrefix, q)
 	}
 }
@@ -430,7 +463,7 @@ func replv1(x context.Context, conn client.Conn) (fatal bool, err error) {
 	for {
 		line, err := t.ReadLine()
 		if err != nil {
-			if err == io.EOF {
+			if isIOEndErr(err) {
 				// break // Ctrl+D, Ctrl+C
 			}
 			fmt.Fprintf(t, "ReadLine: %v\r\n", err)
@@ -453,13 +486,13 @@ func replv1(x context.Context, conn client.Conn) (fatal bool, err error) {
 			if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
 				st := stmts[0]
 				if err := runSQL(x, t, st.cmd, q); err != nil {
-					if err == io.EOF {
+					if isIOEndErr(err) {
 						return false, err
 					}
 				}
 			} else {
 				if err := runSQL(x, t, "", q); err != nil {
-					if err == io.EOF {
+					if isIOEndErr(err) {
 						return false, err
 					}
 				}
@@ -487,7 +520,8 @@ var (
 	borderStyle = lipgloss.NewStyle().
 			BorderStyle(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("62"))
-	grayText = lipgloss.NewStyle().Foreground(lipgloss.Color("103"))
+	navyText = lipgloss.NewStyle().Foreground(lipgloss.Color("103"))
+	grayText = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
 type tuiModel struct {
@@ -680,13 +714,13 @@ func (t *tuiModel) run(x0 context.Context, q string) (fat bool, err error) {
 	if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
 		st := stmts[0]
 		if err := runSQL(x, buf, st.cmd, q); err != nil {
-			if err == io.EOF {
+			if isIOEndErr(err) {
 				return false, err
 			}
 		}
 	} else {
 		if err := runSQL(x, buf, "", q); err != nil {
-			if err == io.EOF {
+			if isIOEndErr(err) {
 				return false, err
 			}
 		}
@@ -777,13 +811,13 @@ func replv3(x context.Context, conn client.Conn) (fatal bool, err error) {
 			if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
 				st := stmts[0]
 				if err := runSQL(x, t, st.cmd, q); err != nil {
-					if err == io.EOF {
+					if isIOEndErr(err) {
 						return false, err
 					}
 				}
 			} else {
 				if err := runSQL(x, t, "", q); err != nil {
-					if err == io.EOF {
+					if isIOEndErr(err) {
 						return false, err
 					}
 				}
@@ -795,7 +829,7 @@ func replv3(x context.Context, conn client.Conn) (fatal bool, err error) {
 
 func replv4(x context.Context, conn client.Conn) (fatal bool, err error) {
 	t := os.Stdout
-	fmt.Fprintln(t, grayText.Render("ctrl+q to exit."))
+	fmt.Fprintln(t, navyText.Render("ctrl+q to exit."))
 
 	h := newSimpleHistory()
 
@@ -836,7 +870,7 @@ func replv4(x context.Context, conn client.Conn) (fatal bool, err error) {
 		if len(line) == 0 {
 			continue
 		} else {
-			fmt.Fprintf(t, ">> %s\r\n", removeCRLF(line))
+			fmt.Fprintf(t, ">> %s\r\n", line)
 		}
 
 		switch line {
@@ -850,13 +884,13 @@ func replv4(x context.Context, conn client.Conn) (fatal bool, err error) {
 		if stmts, err := parseSQLite(q); err == nil && len(stmts) > 0 {
 			st := stmts[0]
 			if err := runSQL(x, t, st.cmd, q); err != nil {
-				if err == io.EOF {
+				if isIOEndErr(err) {
 					return false, err
 				}
 			}
 		} else {
 			if err := runSQL(x, t, "", q); err != nil {
-				if err == io.EOF {
+				if isIOEndErr(err) {
 					return false, err
 				}
 			}
