@@ -1,4 +1,4 @@
-module github.com/smallfz/savage-cli
+module kilohit.com/savage-cli
 
 go 1.25.8
 
